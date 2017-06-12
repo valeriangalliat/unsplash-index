@@ -44,11 +44,14 @@ function indexPhoto (photo) {
     })
 }
 
+const date = () =>
+  (new Date()).toISOString()
+
 const logRequest = res =>
-  console.log('request', res.request.uri.href, res.statusCode, res.headers['x-request-id'], res.request.headers.Authorization.split(' ').pop(), res.headers['x-ratelimit-limit'], res.headers['x-ratelimit-remaining'])
+  console.log(date(), 'request', res.request.uri.href, res.statusCode, res.headers['x-request-id'], res.request.headers.Authorization.split(' ').pop(), res.headers['x-ratelimit-limit'], res.headers['x-ratelimit-remaining'])
 
 const logIndex = (id, res) =>
-  console.log('index', id, res.state)
+  console.log(date(), 'index', id, res.state)
 
 const tokenManager = TokenManager(config.applicationIds || [config.applicationId])
 const requester = log.wrapRequester(tokenManager.wrapRequester(Unsplash.makeRequester()), logRequest)
