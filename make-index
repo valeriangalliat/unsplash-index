@@ -1,87 +1,73 @@
 #!/usr/bin/env node
 
 const fs = require('fs')
-const request = require('request-promise')
-const parseLinkHeader = require('parse-link-header')
 const util = require('util')
 
+const mkdir = util.promisify(fs.mkdir)
 const readFile = util.promisify(fs.readFile)
 const writeFile = util.promisify(fs.writeFile)
-const appendFile = util.promisify(fs.appendFile)
+
+const log = require('./log')
+const TokenManager = require('./token')
+const Unsplash = require('./unsplash')
 
 const config = Object.assign({
-  stateFile: `${__dirname}/state.json`,
-  indexFile: `${__dirname}/index.json`,
-  perPage: 30
+  index: `${__dirname}/index`
 }, require('./config'))
 
-const getState = stateFile =>
-  readFile(stateFile, 'utf8')
+function initIndex () {
+  return mkdir(config.index)
+    .catch(err => {
+      if (err.code !== 'EEXIST') throw err
+    })
+}
+
+function indexPhoto (photo) {
+  const path = `${config.index}/${photo.id}.json`
+
+  return readFile(path, 'utf8')
     .then(JSON.parse)
     .catch(err => {
-      if (err.code === 'ENOENT') return {}
-      throw err
+      if (err.code !== 'ENOENT') throw err
+      return null
     })
+    .then(existingPhoto => {
+      const created = existingPhoto === null
+      const updated = !created && existingPhoto.updated_at !== photo.updated_at
 
-const saveState = (stateFile, state) =>
-  writeFile(stateFile, JSON.stringify(state, null, 2) + '\n')
-
-const appendPhotos = (indexFile, photos) =>
-  appendFile(indexFile, photos.map(JSON.stringify).join('\n') + '\n')
-
-const makeRequest = (config, path, options = {}) => {
-  options = Object.assign({
-    url: `https://api.unsplash.com/${path}`,
-    json: true,
-    resolveWithFullResponse: true
-  }, options, {
-    headers: Object.assign({
-      Authorization: `Client-ID ${config.applicationId}`
-    }, options.headers)
-  })
-
-  const log = res =>
-    console.log(res.request.uri.href, res.statusCode, res.headers['x-request-id'])
-
-  return request(options)
-    .then(res => {
-      log(res)
-      return res
+      return writeFile(path, JSON.stringify(photo, null, 2))
+        .then(() => ({
+          created,
+          updated,
+          state: created ? 'created' : (updated ? 'updated' : 'unchanged')
+        }))
     })
+}
+
+const logRequest = res =>
+  console.log('request', res.request.uri.href, res.statusCode, res.headers['x-request-id'], res.request.headers.Authorization.split(' ').pop(), res.headers['x-ratelimit-limit'], res.headers['x-ratelimit-remaining'])
+
+const logIndex = (id, res) =>
+  console.log('index', id, res.state)
+
+const tokenManager = TokenManager(config.applicationIds || [config.applicationId])
+const requester = log.wrapRequester(tokenManager.wrapRequester(Unsplash.makeRequester()), logRequest)
+const unsplash = Unsplash({ requester })
+
+const crawl = () =>
+  unsplash.getRandomPhotos({ count: 30 })
     .catch(err => {
-      log(err.response)
+      if (err.response.statusCode === 403) return []
       throw err
     })
-}
+    .then(photos => Promise.all(photos.map(photo => {
+      return indexPhoto(photo)
+        .then(res => logIndex(photo.id, res))
+    })))
 
-const getPhotos = (config, options) =>
-  makeRequest(config, 'photos', Object.assign({}, options, { qs: Object.assign({ per_page: config.perPage }, options.qs) }))
-    .then(res => ({
-      total: res.headers['x-total'],
-      perPage: res.headers['x-per-page'],
-      rateLimit: {
-        limit: res.headers['x-ratelimit-limit'],
-        remaining: res.headers['x-ratelimit-remaining']
-      },
-      requestId: res.headers['x-request-id'],
-      link: parseLinkHeader(res.headers.link),
-      photos: res.body
-    }))
+const crawlRecursive = () =>
+  crawl()
+    .then(() => crawlRecursive())
 
-const crawl = (config, state) => {
-  const options = state.nextUrl ? { url: state.nextUrl } : {}
-
-  return getPhotos(config, options)
-    .then(res => appendPhotos(config.indexFile, res.photos).then(() => res))
-    .then(res => Object.assign({}, state, {
-      nextUrl: res.link.next.url
-    }))
-}
-
-const crawlRecursive = (config, state) =>
-  crawl(config, state)
-    .then(state => saveState(config.stateFile, state).then(() => state))
-    .then(state => crawlRecursive(config, state))
-
-getState(config.stateFile)
-  .then(state => crawlRecursive(config, state))
+initIndex()
+  .then(crawlRecursive)
