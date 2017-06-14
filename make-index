@@ -8,22 +8,40 @@ const readFile = util.promisify(fs.readFile)
 const writeFile = util.promisify(fs.writeFile)
 
 const log = require('./log')
+const pagination = require('./pagination')
 const TokenManager = require('./token')
-const Unsplash = require('./unsplash')
+const unsplash = require('./unsplash')
 
 const config = Object.assign({
+  stateFile: `${__dirname}/state.json`,
   index: `${__dirname}/index`
 }, require('./config'))
 
-function initIndex () {
-  return mkdir(config.index)
+const getState = () =>
+  readFile(config.stateFile, 'utf8')
+    .then(JSON.parse)
+    .catch(err => {
+      if (err.code === 'ENOENT') return {}
+      throw err
+    })
+
+const saveState = state =>
+  writeFile(config.stateFile, JSON.stringify(state, null, 2) + '\n')
+
+const ensureDir = dir =>
+  mkdir(dir)
     .catch(err => {
       if (err.code !== 'EEXIST') throw err
     })
+
+function initIndex () {
+  return ensureDir(config.index)
+    .then(() => ensureDir(`${config.index}/users`))
+    .then(() => ensureDir(`${config.index}/photos`))
 }
 
 function indexPhoto (photo) {
-  const path = `${config.index}/${photo.id}.json`
+  const path = `${config.index}/photos/${photo.id}.json`
 
   return readFile(path, 'utf8')
     .then(JSON.parse)
@@ -44,33 +62,65 @@ function indexPhoto (photo) {
     })
 }
 
+function indexUser (user) {
+  const path = `${config.index}/users/${user.username}.json`
+  return writeFile(path, JSON.stringify(user, null, 2))
+}
+
 const date = () =>
   (new Date()).toISOString()
 
 const logRequest = res =>
   console.log(date(), 'request', res.request.uri.href, res.statusCode, res.headers['x-request-id'], res.request.headers.Authorization.split(' ').pop(), res.headers['x-ratelimit-limit'], res.headers['x-ratelimit-remaining'])
 
-const logIndex = (id, res) =>
-  console.log(date(), 'index', id, res.state)
+const logPhoto = (photo, res) =>
+  console.log(date(), 'photo', photo.id, res.state)
+
+const logUser = user =>
+  console.log(date(), 'user', user.username)
 
 const tokenManager = TokenManager(config.applicationIds || [config.applicationId])
-const requester = log.wrapRequester(tokenManager.wrapRequester(Unsplash.makeRequester()), logRequest)
-const unsplash = Unsplash({ requester })
-
-const crawl = () =>
-  unsplash.getRandomPhotos({ count: 30 })
-    .catch(err => {
-      if (err.response.statusCode === 403) return []
-      throw err
-    })
-    .then(photos => Promise.all(photos.map(photo => {
-      return indexPhoto(photo)
-        .then(res => logIndex(photo.id, res))
-    })))
-
-const crawlRecursive = () =>
-  crawl()
-    .then(() => crawlRecursive())
+const requester = log.wrapRequester(tokenManager.wrapRequester(unsplash.makeRequester()), logRequest)
 
 initIndex()
-  .then(crawlRecursive)
+  .then(getState)
+  .then(state => {
+    const iterator = pagination.iterate(requester, req => req
+      .then(res => {
+        return Promise.all(res.body.results.map(user => {
+          return indexUser(user)
+            .then(() => logUser(user))
+        }))
+          .then(() => saveState(Object.assign({}, state, {
+            nextUserPage: res.nextPage
+          })))
+      }))
+
+    if (state.nextUserPage) return iterator.resume(state.nextUserPage)
+
+    return iterator('/search/users', {
+      qs: {
+        query: '*',
+        per_page: 30
+      }
+    })
+  })
+
+// const crawl = () =>
+//   requester('/photos/random', { qs: { count: 30 } })
+//    .then(res => res.body)
+//     .catch(err => {
+//       if (err.response.statusCode === 403) return []
+//       throw err
+//     })
+//     .then(photos => Promise.all(photos.map(photo => {
+//       return indexPhoto(photo)
+//         .then(res => logPhoto(photo, res))
+//     })))
+
+// const crawlRecursive = () =>
+//   crawl()
+//     .then(() => crawlRecursive())
+
+// initIndex()
+//   .then(crawlRecursive)
